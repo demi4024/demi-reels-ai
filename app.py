@@ -1,20 +1,22 @@
 import os
 import hashlib
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 
 import streamlit as st
 import psycopg2
 from psycopg2 import IntegrityError
 from openai import OpenAI
+from streamlit_cookies_controller import CookieController
 
-
-# =========================================================
-# 기본 설정
-# =========================================================
 
 APP_NAME = "데미's 릴스 대본 제작기"
 DEFAULT_FREE_CREDITS = 30
 CREDIT_COST_PER_GENERATION = 1
+
+LOGIN_COOKIE_NAME = "demi_reels_login"
+LOGIN_DAYS = 30
+
 
 st.set_page_config(
     page_title=APP_NAME,
@@ -22,10 +24,6 @@ st.set_page_config(
     layout="centered"
 )
 
-
-# =========================================================
-# 디자인
-# =========================================================
 
 st.markdown(
     """
@@ -66,19 +64,11 @@ st.markdown(
         font-weight: 700;
         border-radius: 10px;
     }
-
-    h1 {
-        font-size: 2rem !important;
-    }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-
-# =========================================================
-# Secrets 불러오기
-# =========================================================
 
 def secret(name, default=""):
     try:
@@ -112,19 +102,17 @@ BANK_HOLDER = secret(
 )
 
 
-# =========================================================
-# 비밀번호 암호화
-# =========================================================
-
 def hash_pw(password):
     return hashlib.sha256(
         password.encode("utf-8")
     ).hexdigest()
 
 
-# =========================================================
-# DB 연결
-# =========================================================
+def hash_token(token):
+    return hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
 
 def get_connection():
 
@@ -140,13 +128,10 @@ def get_connection():
 
     return psycopg2.connect(
         db_url,
-        sslmode="require"
+        sslmode="require",
+        connect_timeout=10
     )
 
-
-# =========================================================
-# DB 테이블 생성
-# =========================================================
 
 def init_db():
 
@@ -201,14 +186,22 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS login_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            token_hash TEXT UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     conn.commit()
     cur.close()
     conn.close()
 
-
-# =========================================================
-# 관리자 생성
-# =========================================================
 
 def init_admin():
 
@@ -290,10 +283,6 @@ def init_admin():
     conn.close()
 
 
-# =========================================================
-# 사용자 조회
-# =========================================================
-
 def get_user(username):
 
     conn = get_connection()
@@ -354,10 +343,6 @@ def get_user_by_id(uid):
     return row
 
 
-# =========================================================
-# 회원가입
-# =========================================================
-
 def create_user(username, password, name):
 
     conn = get_connection()
@@ -399,20 +384,13 @@ def create_user(username, password, name):
 
         conn.rollback()
 
-        return (
-            False,
-            "이미 사용 중인 아이디입니다."
-        )
+        return False, "이미 사용 중인 아이디입니다."
 
     finally:
 
         cur.close()
         conn.close()
 
-
-# =========================================================
-# 크레딧 관리
-# =========================================================
 
 def change_credits(uid, amount):
 
@@ -470,9 +448,125 @@ def deduct_credit(uid):
     return bool(row)
 
 
-# =========================================================
-# 생성 기록
-# =========================================================
+def create_login_token(uid):
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hash_token(token)
+
+    expires_at = (
+        datetime.now()
+        + timedelta(days=LOGIN_DAYS)
+    )
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        DELETE FROM login_tokens
+        WHERE user_id=%s
+           OR expires_at < %s
+        """,
+        (
+            uid,
+            datetime.now()
+        )
+    )
+
+    cur.execute(
+        """
+        INSERT INTO login_tokens
+        (
+            user_id,
+            token_hash,
+            expires_at,
+            created_at
+        )
+        VALUES
+        (%s,%s,%s,%s)
+        """,
+        (
+            uid,
+            token_hash,
+            expires_at,
+            datetime.now()
+        )
+    )
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return token
+
+
+def get_user_from_token(token):
+
+    if not token:
+        return None
+
+    token_hash = hash_token(token)
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            u.id,
+            u.username,
+            u.password_hash,
+            u.name,
+            u.credits,
+            u.is_active,
+            u.is_admin,
+            u.created_at
+        FROM login_tokens lt
+
+        JOIN users u
+            ON u.id = lt.user_id
+
+        WHERE lt.token_hash=%s
+          AND lt.expires_at > %s
+        """,
+        (
+            token_hash,
+            datetime.now()
+        )
+    )
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return row
+
+
+def delete_login_token(token):
+
+    if not token:
+        return
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        DELETE FROM login_tokens
+        WHERE token_hash=%s
+        """,
+        (
+            hash_token(token),
+        )
+    )
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
 
 def save_generation(
     uid,
@@ -522,10 +616,6 @@ def save_generation(
     cur.close()
     conn.close()
 
-
-# =========================================================
-# 충전 요청
-# =========================================================
 
 def create_recharge_request(
     uid,
@@ -591,10 +681,7 @@ def create_recharge_request(
     cur.close()
     conn.close()
 
-    return (
-        True,
-        "충전 요청이 접수되었습니다."
-    )
+    return True, "충전 요청이 접수되었습니다."
 
 
 def get_my_recharge_requests(uid):
@@ -626,10 +713,6 @@ def get_my_recharge_requests(uid):
 
     return rows
 
-
-# =========================================================
-# 관리자 충전 요청 조회
-# =========================================================
 
 def get_pending_recharges():
 
@@ -668,10 +751,6 @@ def get_pending_recharges():
     return rows
 
 
-# =========================================================
-# 충전 승인
-# =========================================================
-
 def approve_recharge(request_id):
 
     conn = get_connection()
@@ -696,26 +775,16 @@ def approve_recharge(request_id):
         request = cur.fetchone()
 
         if not request:
-
             conn.rollback()
-
-            return (
-                False,
-                "요청을 찾을 수 없습니다."
-            )
+            return False, "요청을 찾을 수 없습니다."
 
         uid = request[0]
         credits = request[1]
         status = request[2]
 
         if status != "대기":
-
             conn.rollback()
-
-            return (
-                False,
-                "이미 처리된 요청입니다."
-            )
+            return False, "이미 처리된 요청입니다."
 
         cur.execute(
             """
@@ -745,28 +814,18 @@ def approve_recharge(request_id):
 
         conn.commit()
 
-        return (
-            True,
-            f"{credits}크레딧 지급 완료!"
-        )
+        return True, f"{credits}크레딧 지급 완료!"
 
     except Exception as e:
 
         conn.rollback()
 
-        return (
-            False,
-            str(e)
-        )
+        return False, str(e)
 
     finally:
 
         conn.close()
 
-
-# =========================================================
-# 충전 거절
-# =========================================================
 
 def reject_recharge(request_id):
 
@@ -793,10 +852,6 @@ def reject_recharge(request_id):
     cur.close()
     conn.close()
 
-
-# =========================================================
-# 관리자 수강생 목록
-# =========================================================
 
 def get_students():
 
@@ -849,10 +904,6 @@ def set_user_active(uid, active):
     conn.close()
 
 
-# =========================================================
-# 관리자 사용 기록
-# =========================================================
-
 def get_generation_history():
 
     conn = get_connection()
@@ -873,7 +924,6 @@ def get_generation_history():
             ON u.id = g.user_id
 
         ORDER BY g.created_at DESC
-
         LIMIT 50
         """
     )
@@ -885,10 +935,6 @@ def get_generation_history():
 
     return rows
 
-
-# =========================================================
-# AI 결과 분리
-# =========================================================
 
 def get_section(text, start, end=None):
 
@@ -910,12 +956,7 @@ def get_section(text, start, end=None):
     return content.strip()
 
 
-# =========================================================
-# DB 실행
-# =========================================================
-
 try:
-
     init_db()
     init_admin()
 
@@ -930,23 +971,61 @@ except Exception as e:
     st.stop()
 
 
-# =========================================================
-# 로그인 세션
-# =========================================================
+controller = CookieController()
+
 
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
 
 
+if not st.session_state.user_id:
+
+    try:
+
+        saved_token = controller.get(
+            LOGIN_COOKIE_NAME
+        )
+
+        if saved_token:
+
+            saved_user = get_user_from_token(
+                saved_token
+            )
+
+            if (
+                saved_user
+                and saved_user[5]
+            ):
+
+                st.session_state.user_id = (
+                    saved_user[0]
+                )
+
+    except Exception:
+        pass
+
+
 def logout():
+
+    try:
+
+        token = controller.get(
+            LOGIN_COOKIE_NAME
+        )
+
+        if token:
+            delete_login_token(token)
+
+        controller.remove(
+            LOGIN_COOKIE_NAME
+        )
+
+    except Exception:
+        pass
 
     st.session_state.user_id = None
     st.rerun()
 
-
-# =========================================================
-# 로그인 전
-# =========================================================
 
 if not st.session_state.user_id:
 
@@ -1007,6 +1086,16 @@ if not st.session_state.user_id:
                 )
 
             else:
+
+                login_token = create_login_token(
+                    user[0]
+                )
+
+                controller.set(
+                    LOGIN_COOKIE_NAME,
+                    login_token,
+                    max_age=LOGIN_DAYS * 24 * 60 * 60
+                )
 
                 st.session_state.user_id = user[0]
 
@@ -1104,10 +1193,6 @@ if not st.session_state.user_id:
     st.stop()
 
 
-# =========================================================
-# 로그인 사용자 정보
-# =========================================================
-
 user = get_user_by_id(
     st.session_state.user_id
 )
@@ -1139,10 +1224,6 @@ if (
     st.stop()
 
 
-# =========================================================
-# 상단
-# =========================================================
-
 top1, top2 = st.columns(
     [5, 1]
 )
@@ -1160,10 +1241,6 @@ with top2:
     ):
         logout()
 
-
-# =========================================================
-# 관리자 탭
-# =========================================================
 
 if is_admin:
 
@@ -1185,10 +1262,6 @@ if is_admin:
         ]
     )
 
-
-# =========================================================
-# 수강생 탭
-# =========================================================
 
 else:
 
@@ -1219,10 +1292,6 @@ else:
         ]
     )
 
-
-# =========================================================
-# 수강생 크레딧 충전
-# =========================================================
 
 if not is_admin:
 
@@ -1268,8 +1337,6 @@ if not is_admin:
             unsafe_allow_html=True
         )
 
-        st.write("")
-
         package = st.selectbox(
             "충전할 크레딧",
             [
@@ -1281,16 +1348,10 @@ if not is_admin:
         package_map = {
 
             "50크레딧 - 29,000원":
-                (
-                    50,
-                    29000
-                ),
+                (50, 29000),
 
             "100크레딧 - 57,000원":
-                (
-                    100,
-                    57000
-                )
+                (100, 57000)
         }
 
         recharge_credits, recharge_amount = (
@@ -1305,11 +1366,6 @@ if not is_admin:
         depositor = st.text_input(
             "입금자명",
             placeholder="실제로 송금한 입금자명을 입력해주세요."
-        )
-
-        st.caption(
-            "⚠️ 입금자명이 실제 송금자명과 다르면 "
-            "확인이 늦어질 수 있습니다."
         )
 
         if st.button(
@@ -1376,42 +1432,24 @@ if not is_admin:
             for request in my_requests:
 
                 package_name = request[0]
-                req_credits = request[1]
                 req_amount = request[2]
                 req_depositor = request[3]
                 req_status = request[4]
                 req_date = request[5]
 
-                if req_status == "대기":
-                    status_icon = "⏳"
-
-                elif req_status == "승인":
-                    status_icon = "✅"
-
-                else:
-                    status_icon = "❌"
-
                 st.write(
                     f"**{package_name}**"
-                )
-
-                st.write(
-                    f"{status_icon} 상태 : "
-                    f"**{req_status}**"
                 )
 
                 st.caption(
                     f"입금자명: {req_depositor} · "
                     f"{req_amount:,}원 · "
+                    f"상태: {req_status} · "
                     f"{req_date.strftime('%Y-%m-%d %H:%M')}"
                 )
 
                 st.divider()
 
-
-# =========================================================
-# 릴스 제작
-# =========================================================
 
 with create_tab:
 
@@ -1468,11 +1506,7 @@ with create_tab:
         )
 
         extra = st.text_area(
-            "✍️ 추가 요청사항",
-            placeholder=(
-                "예: 댓글에 '정보' 남기게 해줘 / "
-                "가격은 언급하지 마"
-            )
+            "✍️ 추가 요청사항"
         )
 
         submitted = (
@@ -1487,7 +1521,6 @@ with create_tab:
     if submitted:
 
         latest_user = get_user_by_id(uid)
-
         latest_credits = latest_user[4]
 
         if not topic.strip():
@@ -1503,8 +1536,7 @@ with create_tab:
         ):
 
             st.error(
-                "크레딧이 부족합니다. "
-                "크레딧 충전 메뉴에서 충전해주세요."
+                "크레딧이 부족합니다."
             )
 
         else:
@@ -1523,93 +1555,45 @@ with create_tab:
             else:
 
                 prompt = f"""
-너는 인스타그램 릴스 전문 콘텐츠 기획자이자
-숏폼 카피라이터야.
+너는 인스타그램 릴스 전문 콘텐츠 기획자야.
 
-아래 정보를 바탕으로
-실제로 촬영해서 사용할 수 있는
-한국어 릴스 콘텐츠를 작성해줘.
-
-[주제 또는 상품]
+주제/상품:
 {topic}
 
-[콘텐츠 유형]
+콘텐츠 유형:
 {content_type}
 
-[타깃]
-{target if target else "일반 인스타그램 사용자"}
+타깃:
+{target}
 
-[영상 길이]
+영상 길이:
 {duration}
 
-[말투]
+말투:
 {tone}
 
-[추가 요청]
-{extra if extra else "없음"}
+추가 요청:
+{extra}
 
-[작성 원칙]
-
-1. 첫 1~3초 안에 스크롤을 멈출 수 있는
-강한 후킹을 작성한다.
-
-2. 서로 다른 방향의 후킹을 3개 제안한다.
-
-3. 너무 광고 같은 표현은 피한다.
-
-4. 실제 사람이 말하는 것처럼
-자연스러운 한국어를 사용한다.
-
-5. 한 문장은 짧게 작성한다.
-
-6. 가능하면
-문제 → 공감 → 궁금증 → 해결 → CTA
-흐름을 사용한다.
-
-7. 확인되지 않은 효능이나 기능을
-임의로 만들어내지 않는다.
-
-8. 제공되지 않은 가격, 할인율,
-인증, 판매량 등을 만들어내지 않는다.
-
-9. 영상 길이에 맞는 분량으로 작성한다.
-
-10. 인스타 본문은 릴스 대본을
-그대로 복사하지 않는다.
-
-11. 인스타 본문은 읽기 쉽게 줄바꿈하고
-자연스럽게 이모지를 사용한다.
-
-12. 해시태그는 관련성 높은
-한국어 해시태그 8~12개를 작성한다.
-
-13. CTA는 댓글, 저장, 공유,
-프로필 확인 중 콘텐츠에
-가장 자연스러운 방식을 사용한다.
-
-반드시 아래 형식으로 출력해.
+아래 형식으로 작성해.
 
 [HOOKS]
-1.
-2.
-3.
+3초 후킹 3개
 
 [SCRIPT]
-릴스에서 실제로 말할 전체 대본
+릴스 전체 대본
 
 [SUBTITLES]
-영상 화면에 넣을 자막을 한 줄씩 작성
+화면 자막
 
 [CTA]
-1.
-2.
-3.
+CTA 3개
 
 [CAPTION]
-인스타그램 게시글 본문
+인스타그램 본문
 
 [HASHTAGS]
-해시태그
+관련 해시태그 8~12개
 """
 
                 try:
@@ -1622,23 +1606,17 @@ with create_tab:
                             api_key=api_key
                         )
 
-                        response = (
-                            client.responses.create(
-                                model="gpt-5-mini",
-                                input=prompt
-                            )
+                        response = client.responses.create(
+                            model="gpt-5-mini",
+                            input=prompt
                         )
 
-                        result = (
-                            response.output_text
-                        )
+                        result = response.output_text
 
 
                     if not is_admin:
 
-                        paid = deduct_credit(uid)
-
-                        if not paid:
+                        if not deduct_credit(uid):
 
                             st.error(
                                 "크레딧이 부족합니다."
@@ -1698,77 +1676,35 @@ with create_tab:
                         "콘텐츠가 완성됐어요! 🎉"
                     )
 
-
-                    if not is_admin:
-
-                        updated_user = get_user_by_id(uid)
-
-                        st.info(
-                            f"💎 남은 크레딧: "
-                            f"{updated_user[4]}"
-                        )
-
-
-                    st.divider()
-
                     st.subheader(
                         "🔥 3초 후킹 3개"
                     )
-
-                    st.code(
-                        hooks,
-                        language=None
-                    )
-
+                    st.code(hooks)
 
                     st.subheader(
                         "🎬 릴스 대본"
                     )
-
-                    st.code(
-                        script,
-                        language=None
-                    )
-
+                    st.code(script)
 
                     st.subheader(
                         "📱 화면 자막"
                     )
-
-                    st.code(
-                        subtitles,
-                        language=None
-                    )
-
+                    st.code(subtitles)
 
                     st.subheader(
                         "💬 CTA"
                     )
-
-                    st.code(
-                        cta,
-                        language=None
-                    )
-
+                    st.code(cta)
 
                     st.subheader(
                         "✍️ 인스타 본문"
                     )
-
-                    st.code(
-                        caption,
-                        language=None
-                    )
-
+                    st.code(caption)
 
                     st.subheader(
                         "#️⃣ 해시태그"
                     )
-
-                    st.code(
-                        hashtags,
-                        language=None
-                    )
+                    st.code(hashtags)
 
 
                 except Exception as e:
@@ -1777,17 +1713,8 @@ with create_tab:
                         "AI 생성 중 오류가 발생했습니다."
                     )
 
-                    st.caption(
-                        "생성에 실패한 경우 "
-                        "크레딧은 차감되지 않습니다."
-                    )
-
                     st.code(str(e))
 
-
-# =========================================================
-# 관리자 수강생 관리
-# =========================================================
 
 if is_admin:
 
@@ -1799,127 +1726,94 @@ if is_admin:
 
         students = get_students()
 
-        if not students:
+        for student in students:
 
-            st.info(
-                "가입한 수강생이 없습니다."
+            student_id = student[0]
+            student_username = student[1]
+            student_name = student[2]
+            student_credits = student[3]
+            student_active = student[4]
+
+            status_text = (
+                "이용중"
+                if student_active
+                else "정지"
             )
 
-        else:
+            with st.expander(
+                f"{student_name} · "
+                f"@{student_username} · "
+                f"{student_credits}크레딧 · "
+                f"{status_text}"
+            ):
 
-            for student in students:
-
-                student_id = student[0]
-                student_username = student[1]
-                student_name = student[2]
-                student_credits = student[3]
-                student_active = student[4]
-
-                status_text = (
-                    "이용중"
-                    if student_active
-                    else "정지"
+                col1, col2, col3 = (
+                    st.columns(3)
                 )
 
-                with st.expander(
-                    f"{student_name} · "
-                    f"@{student_username} · "
-                    f"{student_credits}크레딧 · "
-                    f"{status_text}"
+                add_credit = col1.number_input(
+                    "크레딧 지급",
+                    min_value=1,
+                    value=10,
+                    key=f"add_{student_id}"
+                )
+
+                if col1.button(
+                    "지급",
+                    key=f"give_{student_id}"
                 ):
 
-                    col1, col2, col3 = (
-                        st.columns(3)
+                    change_credits(
+                        student_id,
+                        int(add_credit)
                     )
 
-                    add_credit = (
-                        col1.number_input(
-                            "크레딧 지급",
-                            min_value=1,
-                            value=10,
-                            step=1,
-                            key=f"add_{student_id}"
-                        )
+                    st.rerun()
+
+
+                minus_credit = col2.number_input(
+                    "크레딧 차감",
+                    min_value=1,
+                    value=10,
+                    key=f"minus_{student_id}"
+                )
+
+                if col2.button(
+                    "차감",
+                    key=f"deduct_{student_id}"
+                ):
+
+                    change_credits(
+                        student_id,
+                        -int(minus_credit)
                     )
 
-                    if col1.button(
-                        "지급",
-                        key=f"give_{student_id}"
-                    ):
-
-                        change_credits(
-                            student_id,
-                            int(add_credit)
-                        )
-
-                        st.success(
-                            f"{add_credit}크레딧 지급 완료"
-                        )
-
-                        st.rerun()
+                    st.rerun()
 
 
-                    minus_credit = (
-                        col2.number_input(
-                            "크레딧 차감",
-                            min_value=1,
-                            value=10,
-                            step=1,
-                            key=f"minus_{student_id}"
-                        )
+                active_button = (
+                    "이용 정지"
+                    if student_active
+                    else "이용 재개"
+                )
+
+                if col3.button(
+                    active_button,
+                    key=f"active_{student_id}"
+                ):
+
+                    set_user_active(
+                        student_id,
+                        not student_active
                     )
 
-                    if col2.button(
-                        "차감",
-                        key=f"deduct_{student_id}"
-                    ):
+                    st.rerun()
 
-                        change_credits(
-                            student_id,
-                            -int(minus_credit)
-                        )
-
-                        st.success(
-                            f"{minus_credit}크레딧 차감 완료"
-                        )
-
-                        st.rerun()
-
-
-                    active_button = (
-                        "이용 정지"
-                        if student_active
-                        else "이용 재개"
-                    )
-
-                    if col3.button(
-                        active_button,
-                        key=f"active_{student_id}"
-                    ):
-
-                        set_user_active(
-                            student_id,
-                            not student_active
-                        )
-
-                        st.rerun()
-
-
-# =========================================================
-# 관리자 충전 요청
-# =========================================================
-
-if is_admin:
 
     with recharge_admin_tab:
 
         st.subheader(
             "💳 충전 요청 관리"
-        )
-
-        st.caption(
-            "실제 계좌 입금을 확인한 뒤 "
-            "승인 버튼을 눌러주세요."
         )
 
         requests = get_pending_recharges()
@@ -1940,47 +1834,36 @@ if is_admin:
                 req_credits = req[5]
                 req_amount = req[6]
                 req_depositor = req[7]
-                req_created = req[9]
 
                 with st.container(
                     border=True
                 ):
 
                     st.write(
-                        f"### 👤 {req_name} "
-                        f"(@{req_username})"
+                        f"**{req_name} "
+                        f"(@{req_username})**"
                     )
 
                     st.write(
-                        f"🏦 입금자명 : "
+                        f"입금자명: "
                         f"**{req_depositor}**"
                     )
 
                     st.write(
-                        f"💰 입금 확인 금액 : "
+                        f"금액: "
                         f"**{req_amount:,}원**"
                     )
 
                     st.write(
-                        f"💎 지급 크레딧 : "
+                        f"지급: "
                         f"**{req_credits}크레딧**"
                     )
 
-                    st.caption(
-                        "요청 시간 : "
-                        + req_created.strftime(
-                            "%Y-%m-%d %H:%M"
-                        )
-                    )
+                    col1, col2 = st.columns(2)
 
-                    approve_col, reject_col = (
-                        st.columns(2)
-                    )
-
-                    if approve_col.button(
+                    if col1.button(
                         "✅ 입금 확인 · 승인",
                         key=f"approve_{request_id}",
-                        type="primary",
                         use_container_width=True
                     ):
 
@@ -1991,18 +1874,14 @@ if is_admin:
                         )
 
                         if ok:
-
                             st.success(message)
-
                             st.rerun()
-
                         else:
-
                             st.error(message)
 
 
-                    if reject_col.button(
-                        "❌ 요청 거절",
+                    if col2.button(
+                        "❌ 거절",
                         key=f"reject_{request_id}",
                         use_container_width=True
                     ):
@@ -2011,18 +1890,8 @@ if is_admin:
                             request_id
                         )
 
-                        st.warning(
-                            "충전 요청을 거절했습니다."
-                        )
-
                         st.rerun()
 
-
-# =========================================================
-# 관리자 사용 기록
-# =========================================================
-
-if is_admin:
 
     with history_tab:
 
@@ -2032,38 +1901,30 @@ if is_admin:
 
         history = get_generation_history()
 
-        if not history:
+        for item in history:
 
-            st.info(
-                "아직 생성 기록이 없습니다."
+            created = item[0]
+            history_username = item[1]
+            history_name = item[2]
+            product = item[3]
+            history_type = item[4]
+            history_duration = item[5]
+
+            st.write(
+                f"**{history_name} "
+                f"(@{history_username})**"
             )
 
-        else:
+            st.write(
+                f"{product} · "
+                f"{history_type} · "
+                f"{history_duration}"
+            )
 
-            for item in history:
-
-                created = item[0]
-                history_username = item[1]
-                history_name = item[2]
-                product = item[3]
-                history_type = item[4]
-                history_duration = item[5]
-
-                st.write(
-                    f"**{history_name} "
-                    f"(@{history_username})**"
+            st.caption(
+                created.strftime(
+                    "%Y-%m-%d %H:%M"
                 )
+            )
 
-                st.write(
-                    f"{product} · "
-                    f"{history_type} · "
-                    f"{history_duration}"
-                )
-
-                st.caption(
-                    created.strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
-                )
-
-                st.divider()
+            st.divider()
